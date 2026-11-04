@@ -1,0 +1,24 @@
+name: Compilar SP950
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el proyecto
+        uses: actions/checkout@v4
+
+      - name: Preparar
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compilar
+        run: cmake --build build --config Release --target SP950_VST3
+
+      - name: Guardar el plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: SP950-VST3
+          path: build/SP950_artefacts/Release/VST3/
