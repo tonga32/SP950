@@ -1,0 +1,3 @@
+SP950 (version propia) - proyecto para compilar en GitHub.
+Subir TODO el contenido de esta carpeta a un repositorio de GitHub.
+GitHub lo compila solo (pestaña "Actions") y deja el plugin para descargar.
