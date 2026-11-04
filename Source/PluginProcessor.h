@@ -96,7 +96,7 @@ struct Biquad
 class SP950AudioProcessor : public juce::AudioProcessor
 {
 public:
-    static constexpr float kMaxTune = 27.863137f; // 5 veces la velocidad (x5)
+    static constexpr float kMaxTune = 27.863137f; // semitonos hacia abajo (x5)
 
     SP950AudioProcessor();
     ~SP950AudioProcessor() override = default;
@@ -130,10 +130,11 @@ private:
 
     double sr = 44100.0;
     PitchShifter shifter[2];
+    PitchShifter dryDelay[2];
     Biquad filt[2];
     float cutoffCurrent = 20000.0f;
 
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> inGain, outGain, mixAmt;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> inGain, outGain, mixAmt, dwMix;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> ratioSmooth;
 
     std::atomic<float>* pTune = nullptr;
@@ -143,6 +144,7 @@ private:
     std::atomic<float>* pExt = nullptr;
     std::atomic<float>* pMode = nullptr;
     std::atomic<float>* pBypass = nullptr;
+    std::atomic<float>* pMix = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SP950AudioProcessor)
 };

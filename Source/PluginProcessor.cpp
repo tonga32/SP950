@@ -7,6 +7,7 @@ AudioProcessorValueTreeState::ParameterLayout SP950AudioProcessor::createLayout(
 {
     std::vector<std::unique_ptr<RangedAudioParameter>> p;
 
+    // "tune" = semitonos HACIA ABAJO (0 .. 27,86). En pantalla se muestra con signo menos.
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "tune", 1 }, "Tune",
                  NormalisableRange<float> (0.0f, kMaxTune, 0.001f), 0.0f));
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "filter", 1 }, "Filter",
@@ -15,10 +16,14 @@ AudioProcessorValueTreeState::ParameterLayout SP950AudioProcessor::createLayout(
                  NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "out", 1 }, "Out",
                  NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
+    p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "mix", 1 }, "Dry/Wet",
+                 NormalisableRange<float> (0.0f, 100.0f, 0.1f), 100.0f));
     p.push_back (std::make_unique<AudioParameterBool>  (ParameterID { "fine", 1 }, "Fine", false));
     p.push_back (std::make_unique<AudioParameterBool>  (ParameterID { "ext", 1 }, "Ext", true));
+    p.push_back (std::make_unique<AudioParameterBool>  (ParameterID { "link", 1 }, "Link In/Out", false));
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Mode",
-                 StringArray { "Stereo", "Stereo Mid", "Stereo Side" }, 0));
+                 StringArray { "Mono Sum", "Mono L", "Mono R", "Stereo", "Stereo L", "Stereo R",
+                               "Stereo Mid", "Stereo Side" }, 3));
     p.push_back (std::make_unique<AudioParameterBool>  (ParameterID { "bypass", 1 }, "Bypass", false));
 
     return { p.begin(), p.end() };
@@ -37,6 +42,7 @@ SP950AudioProcessor::SP950AudioProcessor()
     pExt    = apvts.getRawParameterValue ("ext");
     pMode   = apvts.getRawParameterValue ("mode");
     pBypass = apvts.getRawParameterValue ("bypass");
+    pMix    = apvts.getRawParameterValue ("mix");
 }
 
 bool SP950AudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -51,6 +57,7 @@ void SP950AudioProcessor::prepareToPlay (double sampleRate, int)
 {
     sr = sampleRate;
     for (auto& s : shifter) s.prepare (sr);
+    for (auto& s : dryDelay) s.prepare (sr);
     for (auto& f : filt) f.reset();
 
     setLatencySamples (shifter[0].getLatency());
@@ -58,8 +65,9 @@ void SP950AudioProcessor::prepareToPlay (double sampleRate, int)
     inGain.reset (sr, 0.02);   inGain.setCurrentAndTargetValue (Decibels::decibelsToGain ((float) *pIn));
     outGain.reset (sr, 0.02);  outGain.setCurrentAndTargetValue (Decibels::decibelsToGain ((float) *pOut));
     mixAmt.reset (sr, 0.03);   mixAmt.setCurrentAndTargetValue (0.0f);
+    dwMix.reset (sr, 0.02);    dwMix.setCurrentAndTargetValue (pMix->load() / 100.0f);
     ratioSmooth.reset (sr, 0.03);
-    ratioSmooth.setCurrentAndTargetValue (std::pow (2.0f, (float) *pTune / 12.0f));
+    ratioSmooth.setCurrentAndTargetValue (std::pow (2.0f, -(float) *pTune / 12.0f));
     cutoffCurrent = 20000.0f;
 }
 
@@ -73,16 +81,16 @@ void SP950AudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
 
     const bool  bypass = pBypass->load() > 0.5f;
     const bool  ext    = pExt->load() > 0.5f;
-    const int   mode   = (int) std::lround (pMode->load());
-    const float tune   = pTune->load();
+    const int   mode   = jlimit (0, 7, (int) std::lround (pMode->load()));
+    const float tune   = pTune->load();   // semitonos hacia abajo
 
-    // pitch: por debajo de ~0,25 semitonos se mezcla con la señal original
-    const float pitchAmount = ext ? jlimit (0.0f, 1.0f, tune / 0.25f) : 0.0f;
-    mixAmt.setTargetValue (pitchAmount);
-    ratioSmooth.setTargetValue (std::pow (2.0f, tune / 12.0f));
+    // por debajo de ~0,25 semitonos se mezcla con la señal original
+    mixAmt.setTargetValue (ext ? jlimit (0.0f, 1.0f, tune / 0.25f) : 0.0f);
+    ratioSmooth.setTargetValue (std::pow (2.0f, -tune / 12.0f));
 
     inGain.setTargetValue  (Decibels::decibelsToGain (pIn->load()));
     outGain.setTargetValue (Decibels::decibelsToGain (pOut->load()));
+    dwMix.setTargetValue   (jlimit (0.0f, 1.0f, pMix->load() / 100.0f));
 
     // filtro: 0..99 -> 20 Hz .. 20 kHz
     const float fv = pFilter->load();
@@ -96,53 +104,66 @@ void SP950AudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
 
     for (int i = 0; i < n; ++i)
     {
-        const float inG  = inGain.getNextValue();
-        const float outG = outGain.getNextValue();
-        const float mix  = mixAmt.getNextValue();
+        const float inG    = inGain.getNextValue();
+        const float outG   = outGain.getNextValue();
+        const float pMixV  = mixAmt.getNextValue();
+        const float dw     = dwMix.getNextValue();
         const double ratio = (double) ratioSmooth.getNextValue();
 
-        float l = c0[i];
-        float r = c1 != nullptr ? c1[i] : l;
+        const float l = c0[i];
+        const float r = c1 != nullptr ? c1[i] : l;
 
-        if (! bypass) { l *= inG; r *= inG; }
+        // señal original, retrasada lo mismo que la procesada (para que no se desfasen)
+        dryDelay[0].tick (l, 1.0);
+        dryDelay[1].tick (r, 1.0);
+        const float dryL = dryDelay[0].lastDry;
+        const float dryR = dryDelay[1].lastDry;
 
-        float a, b;
-        if (mode == 0) { a = l; b = r; }
-        else           { a = (l + r) * 0.5f; b = (l - r) * 0.5f; }
+        if (bypass)
+        {
+            c0[i] = dryL;
+            if (c1 != nullptr) c1[i] = dryR;
+            continue;
+        }
+
+        const float gl = l * inG, gr = r * inG;
+        float a = 0.0f, b = 0.0f;
+        switch (mode)
+        {
+            case 0:  a = (gl + gr) * 0.5f; break;                               // Mono Sum
+            case 1:  a = gl; break;                                             // Mono L
+            case 2:  a = gr; break;                                             // Mono R
+            case 3: case 4: case 5:  a = gl; b = gr; break;                     // Stereo, L, R
+            default: a = (gl + gr) * 0.5f; b = (gl - gr) * 0.5f; break;         // Mid / Side
+        }
 
         const float wetA = shifter[0].tick (a, ratio);
         const float wetB = shifter[1].tick (b, ratio);
         const float dryA = shifter[0].lastDry;
         const float dryB = shifter[1].lastDry;
 
-        const float procA = dryA + mix * (wetA - dryA);
-        const float procB = dryB + mix * (wetB - dryB);
+        const float procA = dryA + pMixV * (wetA - dryA);
+        const float procB = dryB + pMixV * (wetB - dryB);
 
-        float outA, outB;
-        if (mode == 0)      { outA = procA; outB = procB; }
-        else if (mode == 1) { outA = procA; outB = dryB; }   // solo el centro (Mid)
-        else                { outA = dryA;  outB = procB; }  // solo los lados (Side)
-
-        float oL, oR;
-        if (mode == 0) { oL = outA; oR = outB; }
-        else           { oL = outA + outB; oR = outA - outB; }
-
-        if (bypass)
+        float wl, wr;
+        switch (mode)
         {
-            // el bypass también va retrasado lo mismo, así no se desfasa
-            if (mode == 0) { oL = dryA; oR = dryB; }
-            else           { oL = dryA + dryB; oR = dryA - dryB; }
-            // (en bypass no se aplica filtro ni volumen)
-            c0[i] = oL;
-            if (c1 != nullptr) c1[i] = oR;
-            continue;
+            case 0: case 1: case 2:  wl = wr = procA; break;
+            case 3:  wl = procA; wr = procB; break;
+            case 4:  wl = procA; wr = dryB;  break;
+            case 5:  wl = dryA;  wr = procB; break;
+            case 6:  wl = procA + dryB; wr = procA - dryB; break;   // solo el centro
+            default: wl = dryA + procB; wr = dryA - procB; break;   // solo los costados
         }
 
-        oL = filt[0].process (oL) * outG;
-        oR = filt[1].process (oR) * outG;
+        wl = filt[0].process (wl);
+        wr = filt[1].process (wr);
 
-        c0[i] = oL;
-        if (c1 != nullptr) c1[i] = oR;
+        const float oL = dryL + dw * (wl - dryL);
+        const float oR = dryR + dw * (wr - dryR);
+
+        c0[i] = oL * outG;
+        if (c1 != nullptr) c1[i] = oR * outG;
     }
 }
 

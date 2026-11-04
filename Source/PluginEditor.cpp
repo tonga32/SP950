@@ -5,19 +5,24 @@ using namespace juce;
 
 namespace
 {
-    constexpr float kScale = 0.5f;
     constexpr float kMaxTune = SP950AudioProcessor::kMaxTune;
 
     constexpr float kSliderTop = 602.0f, kSliderLen = 576.0f;
     const Rectangle<float> sliderArea (215.0f, 560.0f, 300.0f, 680.0f);
 
-    const Point<float> knobCentre[3] = { { 665.0f, 665.0f }, { 665.0f, 903.0f }, { 665.0f, 1140.0f } };
-    const char* const knobId[3] = { "in", "out", "filter" };
+    // 0 = in, 1 = out, 2 = filter, 3 = dry/wet
+    const Point<float> knobCentre[4] = { { 665.0f, 665.0f }, { 665.0f, 903.0f },
+                                         { 665.0f, 1140.0f }, { 897.0f, 153.0f } };
+    const char* const knobId[4]  = { "in", "out", "filter", "mix" };
+    const float knobHit[4]       = { 90.0f, 90.0f, 90.0f, 48.0f };
+    const float knobSens[4]      = { 300.0f, 300.0f, 300.0f, 200.0f };
 
-    const Rectangle<float> fineBox  (224.0f, 1283.0f, 86.0f, 86.0f);
-    const Rectangle<float> extBox   (428.0f, 1283.0f, 86.0f, 86.0f);
-    const Rectangle<float> comboBox (588.0f, 45.0f, 255.0f, 58.0f);
-    const Rectangle<float> bypassBox(588.0f, 122.0f, 255.0f, 64.0f);
+    const Rectangle<float> fineBox   (224.0f, 1283.0f, 86.0f, 86.0f);
+    const Rectangle<float> extBox    (428.0f, 1283.0f, 86.0f, 86.0f);
+    const Rectangle<float> linkBox   (822.0f, 742.0f, 82.0f, 82.0f);
+    const Rectangle<float> comboBox  (588.0f, 45.0f, 255.0f, 58.0f);
+    const Rectangle<float> bypassBox (588.0f, 122.0f, 255.0f, 64.0f);
+    const Rectangle<float> menuBox   (855.0f, 38.0f, 80.0f, 66.0f);
 
     float tuneToY (float t) { return kSliderTop + (t / kMaxTune) * kSliderLen; }
 }
@@ -26,14 +31,32 @@ SP950Editor::SP950Editor (SP950AudioProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
     panel = ImageCache::getFromMemory (BinaryData::panel_png, BinaryData::panel_pngSize);
-    setSize (488, 806);
-    setResizable (false, false);
+
+    constrainer.setFixedAspectRatio (976.0 / 1612.0);
+    constrainer.setSizeLimits (244, 403, 976, 1612);
+    setConstrainer (&constrainer);
+
+    const int w = jlimit (244, 976, (int) proc.apvts.state.getProperty ("editorWidth", 488));
+    setSize (w, roundToInt ((float) w * 1612.0f / 976.0f));
+    setResizable (true, true);
+
     startTimerHz (30);
 }
 
 SP950Editor::~SP950Editor()
 {
     stopTimer();
+}
+
+void SP950Editor::resized()
+{
+    proc.apvts.state.setProperty ("editorWidth", getWidth(), nullptr);
+}
+
+void SP950Editor::setZoom (int percent)
+{
+    const int w = roundToInt (488.0f * (float) percent / 100.0f);
+    setSize (w, roundToInt ((float) w * 1612.0f / 976.0f));
 }
 
 // ---------------------------------------------------------------- ayudas
@@ -104,11 +127,83 @@ void SP950Editor::applySliderPos (float y)
     setActiveNorm (t / kMaxTune);
 }
 
+// ---------------------------------------------------------------- menús
+void SP950Editor::showModeMenu()
+{
+    const int current = (int) std::lround (proc.apvts.getRawParameterValue ("mode")->load());
+    const char* names[8] = { "Mono Sum", "Mono L", "Mono R", "Stereo", "Stereo L", "Stereo R",
+                             "Stereo Mid", "Stereo Side" };
+
+    PopupMenu m;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (i == 3) m.addSeparator();
+        m.addItem (i + 1, names[i], true, current == i);
+    }
+
+    const float s = scale();
+    const Rectangle<int> area ((int) (comboBox.getX() * s), (int) (comboBox.getY() * s),
+                               (int) (comboBox.getWidth() * s), (int) (comboBox.getHeight() * s));
+
+    Component::SafePointer<SP950Editor> safe (this);
+    m.showMenuAsync (PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (area)),
+                     [safe] (int result)
+                     {
+                         if (safe != nullptr && result > 0)
+                             safe->setChoice (result - 1);
+                     });
+}
+
+void SP950Editor::showMainMenu()
+{
+    const int zooms[7] = { 50, 67, 80, 100, 125, 150, 200 };
+    const int currentPercent = roundToInt ((float) getWidth() / 488.0f * 100.0f);
+
+    PopupMenu zoom;
+    for (int i = 0; i < 7; ++i)
+        zoom.addItem (101 + i, String (zooms[i]) + "%", true, std::abs (currentPercent - zooms[i]) <= 2);
+
+    PopupMenu m;
+    m.addSubMenu ("GUI Zoom", zoom);
+    m.addSeparator();
+    m.addItem (1, "Load From Clipboard");
+    m.addItem (2, "Save To Clipboard");
+
+    const float s = scale();
+    const Rectangle<int> area ((int) (menuBox.getX() * s), (int) (menuBox.getY() * s),
+                               (int) (menuBox.getWidth() * s), (int) (menuBox.getHeight() * s));
+
+    Component::SafePointer<SP950Editor> safe (this);
+    m.showMenuAsync (PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (area)),
+                     [safe, zooms] (int result)
+                     {
+                         if (safe == nullptr || result <= 0) return;
+
+                         if (result >= 101 && result <= 107)
+                         {
+                             safe->setZoom (zooms[result - 101]);
+                         }
+                         else if (result == 2)
+                         {
+                             if (auto xml = safe->proc.apvts.copyState().createXml())
+                                 SystemClipboard::copyTextToClipboard (xml->toString());
+                         }
+                         else if (result == 1)
+                         {
+                             if (auto xml = parseXML (SystemClipboard::getTextFromClipboard()))
+                                 if (xml->hasTagName (safe->proc.apvts.state.getType()))
+                                     safe->proc.apvts.replaceState (ValueTree::fromXml (*xml));
+                         }
+                     });
+}
+
 // ---------------------------------------------------------------- ratón
 void SP950Editor::mouseDown (const MouseEvent& e)
 {
-    const Point<float> p = e.position / kScale;
+    const Point<float> p = e.position / scale();
     dragMode = Drag::none;
+    activeKnob = -1;
+    linkedParam = nullptr;
 
     if (sliderArea.contains (p))
     {
@@ -121,52 +216,59 @@ void SP950Editor::mouseDown (const MouseEvent& e)
         return;
     }
 
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
     {
-        if (p.getDistanceFrom (knobCentre[i]) < 90.0f)
+        if (p.getDistanceFrom (knobCentre[i]) < knobHit[i])
         {
             beginDrag (knobId[i]);
             dragMode = Drag::knob;
+            activeKnob = i;
             dragStartY = p.y;
             dragStartNorm = getNorm (knobId[i]);
+
+            // In y Out enlazados: se mueven al revés (si uno sube, el otro baja)
+            if (i < 2 && getBool ("link") && activeParam != nullptr)
+            {
+                linkedParam = proc.apvts.getParameter (knobId[1 - i]);
+                if (linkedParam != nullptr)
+                {
+                    linkedParam->beginChangeGesture();
+                    thisStartDb = activeParam->convertFrom0to1 (activeParam->getValue());
+                    linkStartDb = linkedParam->convertFrom0to1 (linkedParam->getValue());
+                }
+            }
             return;
         }
     }
 
     if (fineBox.contains (p))   { clickToggle ("fine");   return; }
     if (extBox.contains (p))    { clickToggle ("ext");    return; }
+    if (linkBox.contains (p))   { clickToggle ("link");   return; }
     if (bypassBox.contains (p)) { clickToggle ("bypass"); return; }
-
-    if (comboBox.contains (p))
-    {
-        const int current = (int) std::lround (proc.apvts.getRawParameterValue ("mode")->load());
-
-        PopupMenu m;
-        m.addItem (1, "Stereo",      true, current == 0);
-        m.addItem (2, "Stereo Mid",  true, current == 1);
-        m.addItem (3, "Stereo Side", true, current == 2);
-
-        const Rectangle<int> area ((int) (comboBox.getX() * kScale), (int) (comboBox.getY() * kScale),
-                                   (int) (comboBox.getWidth() * kScale), (int) (comboBox.getHeight() * kScale));
-
-        Component::SafePointer<SP950Editor> safe (this);
-        m.showMenuAsync (PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (area)),
-                         [safe] (int result)
-                         {
-                             if (safe != nullptr && result > 0)
-                                 safe->setChoice (result - 1);
-                         });
-    }
+    if (comboBox.contains (p))  { showModeMenu();         return; }
+    if (menuBox.contains (p))   { showMainMenu();         return; }
 }
 
 void SP950Editor::mouseDrag (const MouseEvent& e)
 {
-    const Point<float> p = e.position / kScale;
+    const Point<float> p = e.position / scale();
 
     if (dragMode == Drag::slider)
+    {
         applySliderPos (p.y - dragOffset);
-    else if (dragMode == Drag::knob)
-        setActiveNorm (dragStartNorm + (dragStartY - p.y) / 300.0f);
+    }
+    else if (dragMode == Drag::knob && activeKnob >= 0)
+    {
+        const float norm = jlimit (0.0f, 1.0f, dragStartNorm + (dragStartY - p.y) / knobSens[activeKnob]);
+        setActiveNorm (norm);
+
+        if (linkedParam != nullptr && activeParam != nullptr)
+        {
+            const float newDb = activeParam->convertFrom0to1 (norm);
+            const float otherDb = jlimit (-24.0f, 24.0f, linkStartDb - (newDb - thisStartDb));
+            linkedParam->setValueNotifyingHost (linkedParam->convertTo0to1 (otherDb));
+        }
+    }
 }
 
 void SP950Editor::mouseUp (const MouseEvent&)
@@ -176,17 +278,23 @@ void SP950Editor::mouseUp (const MouseEvent&)
         activeParam->endChangeGesture();
         activeParam = nullptr;
     }
+    if (linkedParam != nullptr)
+    {
+        linkedParam->endChangeGesture();
+        linkedParam = nullptr;
+    }
     dragMode = Drag::none;
+    activeKnob = -1;
 }
 
 void SP950Editor::mouseDoubleClick (const MouseEvent& e)
 {
-    const Point<float> p = e.position / kScale;
+    const Point<float> p = e.position / scale();
 
     if (sliderArea.contains (p)) { resetParam ("tune"); return; }
 
-    for (int i = 0; i < 3; ++i)
-        if (p.getDistanceFrom (knobCentre[i]) < 90.0f)
+    for (int i = 0; i < 4; ++i)
+        if (p.getDistanceFrom (knobCentre[i]) < knobHit[i])
             resetParam (knobId[i]);
 }
 
@@ -196,15 +304,17 @@ void SP950Editor::paint (Graphics& g)
     g.setImageResamplingQuality (Graphics::highResamplingQuality);
     g.drawImage (panel, getLocalBounds().toFloat(), RectanglePlacement::stretchToFit);
 
-    g.addTransform (AffineTransform::scale (kScale));
+    g.addTransform (AffineTransform::scale (scale()));
 
     drawLcd (g);
     drawSlider (g);
     for (int i = 0; i < 3; ++i)
         drawKnob (g, knobCentre[i], getNorm (knobId[i]));
+    drawMixKnob (g, knobCentre[3], getNorm ("mix"));
 
     drawToggle (g, fineBox, getBool ("fine"));
     drawToggle (g, extBox,  getBool ("ext"));
+    drawToggle (g, linkBox, getBool ("link"));
 
     // menú de modo
     drawButtonBox (g, comboBox, false);
@@ -218,12 +328,23 @@ void SP950Editor::paint (Graphics& g)
                        comboBox.getRight() - 35.0f, comboBox.getY() + 38.0f);
     g.fillPath (arrow);
 
-    // botón bypass
-    const bool byp = getBool ("bypass");
-    drawButtonBox (g, bypassBox, byp);
-    g.setColour (Colour (0xff111111));
-    g.setFont (Font (34.0f));
-    g.drawText ("Bypass", bypassBox, Justification::centred, false);
+    // botón bypass (mientras se mueve la perilla dry/wet muestra el porcentaje)
+    if (dragMode == Drag::knob && activeKnob == 3)
+    {
+        g.setColour (Colour (0xff101010));
+        g.fillRect (bypassBox);
+        g.setColour (Colours::white);
+        g.setFont (Font (34.0f));
+        const int wet = (int) std::lround (proc.apvts.getRawParameterValue ("mix")->load());
+        g.drawText (String (wet) + "% wet", bypassBox, Justification::centred, false);
+    }
+    else
+    {
+        drawButtonBox (g, bypassBox, getBool ("bypass"));
+        g.setColour (Colour (0xff111111));
+        g.setFont (Font (34.0f));
+        g.drawText ("Bypass", bypassBox, Justification::centred, false);
+    }
 }
 
 void SP950Editor::drawLcd (Graphics& g)
@@ -240,13 +361,14 @@ void SP950Editor::drawLcd (Graphics& g)
     for (float y = r.getY(); y < r.getBottom(); y += 8.0f)
         g.fillRect (r.getX(), y, r.getWidth(), 1.0f);
 
+    // Tune: se muestra en negativo (el tono baja al bajar el slider)
     const float tune = getTune();
     const bool fine = getBool ("fine");
     String tuneStr;
     if (fine)
-        tuneStr = (tune > 0.049f ? "+" : "") + String (tune, 1);
+        tuneStr = (tune > 0.049f ? "-" : "") + String (tune, 1);
     else
-        tuneStr = (std::lround (tune) > 0 ? "+" : "") + String ((int) std::lround (tune));
+        tuneStr = (std::lround (tune) > 0 ? "-" : "") + String ((int) std::lround (tune));
 
     const float filterVal = proc.apvts.getRawParameterValue ("filter")->load();
     const String filterStr (String ((int) std::lround (filterVal)));
@@ -260,7 +382,6 @@ void SP950Editor::drawLcd (Graphics& g)
     g.drawText ("Filter:", Rectangle<float> (208.0f, 380.0f, 240.0f, 70.0f), Justification::centredLeft, false);
     g.drawText (filterStr, Rectangle<float> (380.0f, 380.0f, 180.0f, 70.0f), Justification::centredRight, false);
 
-    // barras de bloques
     const float tuneFrac   = jlimit (0.0f, 1.0f, tune / kMaxTune);
     const float filterFrac = jlimit (0.0f, 1.0f, filterVal / 99.0f);
     for (int line = 0; line < 2; ++line)
@@ -318,6 +439,29 @@ void SP950Editor::drawKnob (Graphics& g, Point<float> c, float norm)
     line.lineTo (c + dir * 56.0f);
     g.setColour (Colour (0xfff2efe6));
     g.strokePath (line, PathStrokeType (9.0f, PathStrokeType::curved, PathStrokeType::rounded));
+}
+
+void SP950Editor::drawMixKnob (Graphics& g, Point<float> c, float norm)
+{
+    const float R = 42.0f;
+
+    g.setColour (Colours::black.withAlpha (0.5f));
+    g.fillEllipse (c.x - R - 3.0f, c.y - R + 3.0f, 2.0f * R + 6.0f, 2.0f * R + 6.0f);
+
+    g.setGradientFill (ColourGradient (Colour (0xffe9e9e9), c.x - 18.0f, c.y - 22.0f,
+                                       Colour (0xff6a6a6a), c.x + R, c.y + R, true));
+    g.fillEllipse (c.x - R, c.y - R, 2.0f * R, 2.0f * R);
+
+    g.setColour (Colour (0xff2a2a2a));
+    g.drawEllipse (c.x - R, c.y - R, 2.0f * R, 2.0f * R, 3.0f);
+
+    const float angle = (norm - 0.5f) * 270.0f * MathConstants<float>::pi / 180.0f;
+    const Point<float> dir (std::sin (angle), -std::cos (angle));
+    Path line;
+    line.startNewSubPath (c + dir * 8.0f);
+    line.lineTo (c + dir * 32.0f);
+    g.setColour (Colour (0xff151515));
+    g.strokePath (line, PathStrokeType (7.0f, PathStrokeType::curved, PathStrokeType::rounded));
 }
 
 void SP950Editor::drawToggle (Graphics& g, Rectangle<float> r, bool on)
