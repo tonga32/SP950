@@ -1,70 +1,8 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
-#include <vector>
 
-// ---------------------------------------------------------------
-// Cambia el tono moviendo dos "lecturas" por una memoria corta
-// y mezclándolas suavemente (método clásico de pitch shifter).
-// ---------------------------------------------------------------
-class PitchShifter
-{
-public:
-    void prepare (double sampleRate)
-    {
-        windowSize = juce::jmax (64, (int) (0.05 * sampleRate)); // 50 ms
-        bufSize    = windowSize + 16;
-        buffer.assign ((size_t) bufSize, 0.0f);
-        writePos = 0;
-        phase = 0.0;
-        lastDry = 0.0f;
-    }
-
-    int getLatency() const { return windowSize / 2 + 2; }
-
-    // Devuelve la señal con el tono cambiado. lastDry queda con la señal
-    // original retrasada lo mismo (para que todo quede alineado).
-    float tick (float in, double ratio)
-    {
-        buffer[(size_t) writePos] = in;
-        writePos = (writePos + 1) % bufSize;
-
-        phase += (1.0 - ratio) / (double) windowSize;
-        phase -= std::floor (phase);
-
-        double p1 = phase + 0.5;
-        p1 -= std::floor (p1);
-
-        const double d0 = 2.0 + phase * (double) windowSize;
-        const double d1 = 2.0 + p1    * (double) windowSize;
-
-        const double s = std::sin (juce::MathConstants<double>::pi * phase);
-        const float w0 = (float) (s * s);
-        const float w1 = 1.0f - w0;
-
-        lastDry = readAt (2.0 + 0.5 * (double) windowSize);
-        return w0 * readAt (d0) + w1 * readAt (d1);
-    }
-
-    float lastDry = 0.0f;
-
-private:
-    float readAt (double delay) const
-    {
-        double pos = (double) writePos - delay;
-        while (pos < 0.0) pos += (double) bufSize;
-        const int i0 = (int) pos;
-        const float fr = (float) (pos - (double) i0);
-        const int i1 = (i0 + 1) % bufSize;
-        return buffer[(size_t) i0] * (1.0f - fr) + buffer[(size_t) i1] * fr;
-    }
-
-    std::vector<float> buffer;
-    int bufSize = 1024, windowSize = 512, writePos = 0;
-    double phase = 0.0;
-};
-
-// Filtro pasa-bajos simple (12 dB por octava)
+// Filtro pasa-bajos de 2 polos
 struct Biquad
 {
     float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
@@ -93,10 +31,56 @@ struct Biquad
     void reset() { z1 = z2 = 0; }
 };
 
+// ---------------------------------------------------------------
+// Convertidor estilo SP-1200: toma muestras de 12 bits a una frecuencia
+// fija de 26,04 kHz. Como la fuente se "acelera" (RPM) y luego se baja
+// con el detune, el resultado es: mismo tono y duración, pero con
+// menos ancho de banda y aliasing que cambian con el detune.
+// ---------------------------------------------------------------
+struct SPConverter
+{
+    double phase = 0.0;
+    float held = 0.0f;
+    Biquad inLp, outLp;
+
+    void reset()
+    {
+        phase = 0.0;
+        held = 0.0f;
+        inLp.reset();
+        outLp.reset();
+    }
+
+    void setFilters (double hostRate, double effRate)
+    {
+        const double fc = juce::jmin (0.45 * hostRate, 0.5 * effRate);
+        inLp.setLowpass (hostRate, fc, 0.7071);
+        outLp.setLowpass (hostRate, fc, 0.7071);
+    }
+
+    float process (float x, double step)
+    {
+        const float xin = inLp.process (x);
+
+        phase += step;
+        if (phase >= 1.0)
+        {
+            phase -= 1.0;
+            if (phase >= 1.0) phase = 0.0;
+
+            // 12 bits
+            const float c = juce::jlimit (-1.0f, 0.99951f, xin);
+            held = std::floor (c * 2048.0f + 0.5f) / 2048.0f;
+        }
+        return outLp.process (held);
+    }
+};
+
 class SP950AudioProcessor : public juce::AudioProcessor
 {
 public:
-    static constexpr float kMaxTune = 27.863137f; // semitonos hacia abajo (x5)
+    static constexpr float kMaxTune = 27.863137f;   // x5 (con "ext." activado)
+    static constexpr float kNormalMaxTune = 15.0f;  // con "ext." apagado
 
     SP950AudioProcessor();
     ~SP950AudioProcessor() override = default;
@@ -129,13 +113,12 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
     double sr = 44100.0;
-    PitchShifter shifter[2];
-    PitchShifter dryDelay[2];
-    Biquad filt[2];
+    SPConverter conv[2];
+    Biquad filt[2][2];          // filtro tipo S950: 4 polos (2 etapas) por canal
     float cutoffCurrent = 20000.0f;
 
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> inGain, outGain, mixAmt, dwMix;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> ratioSmooth;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> inGain, outGain, dwMix;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> tuneSmooth;
 
     std::atomic<float>* pTune = nullptr;
     std::atomic<float>* pFilter = nullptr;

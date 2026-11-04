@@ -56,18 +56,16 @@ bool SP950AudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
 void SP950AudioProcessor::prepareToPlay (double sampleRate, int)
 {
     sr = sampleRate;
-    for (auto& s : shifter) s.prepare (sr);
-    for (auto& s : dryDelay) s.prepare (sr);
-    for (auto& f : filt) f.reset();
+    for (auto& c : conv) c.reset();
+    for (auto& ch : filt) for (auto& f : ch) f.reset();
 
-    setLatencySamples (shifter[0].getLatency());
+    setLatencySamples (0);
 
     inGain.reset (sr, 0.02);   inGain.setCurrentAndTargetValue (Decibels::decibelsToGain ((float) *pIn));
     outGain.reset (sr, 0.02);  outGain.setCurrentAndTargetValue (Decibels::decibelsToGain ((float) *pOut));
-    mixAmt.reset (sr, 0.03);   mixAmt.setCurrentAndTargetValue (0.0f);
     dwMix.reset (sr, 0.02);    dwMix.setCurrentAndTargetValue (pMix->load() / 100.0f);
-    ratioSmooth.reset (sr, 0.03);
-    ratioSmooth.setCurrentAndTargetValue (std::pow (2.0f, -(float) *pTune / 12.0f));
+    tuneSmooth.reset (sr, 0.03);
+    tuneSmooth.setCurrentAndTargetValue (0.0f);
     cutoffCurrent = 20000.0f;
 }
 
@@ -79,52 +77,46 @@ void SP950AudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
     const int n = buffer.getNumSamples();
     if (numCh < 1) return;
 
-    const bool  bypass = pBypass->load() > 0.5f;
-    const bool  ext    = pExt->load() > 0.5f;
-    const int   mode   = jlimit (0, 7, (int) std::lround (pMode->load()));
-    const float tune   = pTune->load();   // semitonos hacia abajo
+    if (pBypass->load() > 0.5f)
+        return;   // bypass: la señal pasa sin tocar
 
-    // por debajo de ~0,25 semitonos se mezcla con la señal original
-    mixAmt.setTargetValue (ext ? jlimit (0.0f, 1.0f, tune / 0.25f) : 0.0f);
-    ratioSmooth.setTargetValue (std::pow (2.0f, -tune / 12.0f));
+    const bool  ext  = pExt->load() > 0.5f;
+    const int   mode = jlimit (0, 7, (int) std::lround (pMode->load()));
+    const float tune = jmin (pTune->load(), ext ? kMaxTune : kNormalMaxTune);   // detune en semitonos (hacia abajo)
 
+    tuneSmooth.setTargetValue (tune);
     inGain.setTargetValue  (Decibels::decibelsToGain (pIn->load()));
     outGain.setTargetValue (Decibels::decibelsToGain (pOut->load()));
     dwMix.setTargetValue   (jlimit (0.0f, 1.0f, pMix->load() / 100.0f));
 
-    // filtro: 0..99 -> 20 Hz .. 20 kHz
+    // filtro tipo S950: 0..99 -> 20 Hz .. 20 kHz, 4 polos (Butterworth)
     const float fv = pFilter->load();
     float cutoffTarget = 20.0f * std::pow (1000.0f, fv / 99.0f);
     cutoffTarget = jmin (cutoffTarget, (float) (sr * 0.45));
     cutoffCurrent += (cutoffTarget - cutoffCurrent) * 0.35f;
-    for (auto& f : filt) f.setLowpass (sr, (double) cutoffCurrent, 0.7071);
+    for (auto& ch : filt)
+    {
+        ch[0].setLowpass (sr, (double) cutoffCurrent, 0.5412);
+        ch[1].setLowpass (sr, (double) cutoffCurrent, 1.3066);
+    }
+
+    // frecuencia de muestreo efectiva del "SP" vista desde la señal original
+    constexpr double kSpRate = 26040.0;
+    const double effStart = kSpRate / std::pow (2.0, (double) tuneSmooth.getCurrentValue() / 12.0);
+    for (auto& c : conv) c.setFilters (sr, effStart);
 
     auto* c0 = buffer.getWritePointer (0);
     auto* c1 = numCh > 1 ? buffer.getWritePointer (1) : nullptr;
 
     for (int i = 0; i < n; ++i)
     {
-        const float inG    = inGain.getNextValue();
-        const float outG   = outGain.getNextValue();
-        const float pMixV  = mixAmt.getNextValue();
-        const float dw     = dwMix.getNextValue();
-        const double ratio = (double) ratioSmooth.getNextValue();
+        const float inG  = inGain.getNextValue();
+        const float outG = outGain.getNextValue();
+        const float dw   = dwMix.getNextValue();
+        const double step = (kSpRate / std::pow (2.0, (double) tuneSmooth.getNextValue() / 12.0)) / sr;
 
         const float l = c0[i];
         const float r = c1 != nullptr ? c1[i] : l;
-
-        // señal original, retrasada lo mismo que la procesada (para que no se desfasen)
-        dryDelay[0].tick (l, 1.0);
-        dryDelay[1].tick (r, 1.0);
-        const float dryL = dryDelay[0].lastDry;
-        const float dryR = dryDelay[1].lastDry;
-
-        if (bypass)
-        {
-            c0[i] = dryL;
-            if (c1 != nullptr) c1[i] = dryR;
-            continue;
-        }
 
         const float gl = l * inG, gr = r * inG;
         float a = 0.0f, b = 0.0f;
@@ -137,30 +129,25 @@ void SP950AudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
             default: a = (gl + gr) * 0.5f; b = (gl - gr) * 0.5f; break;         // Mid / Side
         }
 
-        const float wetA = shifter[0].tick (a, ratio);
-        const float wetB = shifter[1].tick (b, ratio);
-        const float dryA = shifter[0].lastDry;
-        const float dryB = shifter[1].lastDry;
-
-        const float procA = dryA + pMixV * (wetA - dryA);
-        const float procB = dryB + pMixV * (wetB - dryB);
+        const float procA = conv[0].process (a, step);
+        const float procB = conv[1].process (b, step);
 
         float wl, wr;
         switch (mode)
         {
             case 0: case 1: case 2:  wl = wr = procA; break;
             case 3:  wl = procA; wr = procB; break;
-            case 4:  wl = procA; wr = dryB;  break;
-            case 5:  wl = dryA;  wr = procB; break;
-            case 6:  wl = procA + dryB; wr = procA - dryB; break;   // solo el centro
-            default: wl = dryA + procB; wr = dryA - procB; break;   // solo los costados
+            case 4:  wl = procA; wr = b;     break;
+            case 5:  wl = a;     wr = procB; break;
+            case 6:  wl = procA + b; wr = procA - b; break;   // solo el centro
+            default: wl = a + procB; wr = a - procB; break;   // solo los costados
         }
 
-        wl = filt[0].process (wl);
-        wr = filt[1].process (wr);
+        wl = filt[0][1].process (filt[0][0].process (wl));
+        wr = filt[1][1].process (filt[1][0].process (wr));
 
-        const float oL = dryL + dw * (wl - dryL);
-        const float oR = dryR + dw * (wr - dryR);
+        const float oL = l + dw * (wl - l);
+        const float oR = r + dw * (wr - r);
 
         c0[i] = oL * outG;
         if (c1 != nullptr) c1[i] = oR * outG;

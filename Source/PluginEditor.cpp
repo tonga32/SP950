@@ -73,7 +73,9 @@ bool SP950Editor::getBool (const char* id) const
 
 float SP950Editor::getTune() const
 {
-    return proc.apvts.getRawParameterValue ("tune")->load();
+    // con "ext." apagado el slider llega solo hasta -15 (la marca de 78 RPM)
+    const float limit = getBool ("ext") ? kMaxTune : SP950AudioProcessor::kNormalMaxTune;
+    return jmin (proc.apvts.getRawParameterValue ("tune")->load(), limit);
 }
 
 void SP950Editor::beginDrag (const char* id)
@@ -121,9 +123,12 @@ void SP950Editor::resetParam (const char* id)
 void SP950Editor::applySliderPos (float y)
 {
     float t = (y - kSliderTop) / kSliderLen * kMaxTune;
-    t = jlimit (0.0f, kMaxTune, t);
-    if (! getBool ("fine"))
-        t = jmin (kMaxTune, std::round (t));
+    const float limit = getBool ("ext") ? kMaxTune : SP950AudioProcessor::kNormalMaxTune;
+    t = jlimit (0.0f, limit, t);
+    if (getBool ("fine"))
+        t = std::round (t * 10.0f) / 10.0f;      // fine: pasos de décimas de semitono
+    else
+        t = jmin (limit, std::round (t));        // normal: semitonos enteros
     setActiveNorm (t / kMaxTune);
 }
 
